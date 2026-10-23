@@ -77,6 +77,7 @@
     "cf:prepare": "npm-run-all cf:schema cf:db:generate cf:typegen build:tracker build:recorder build:openapi build:packages",
     "cf:build": "npm-run-all cf:prepare cf:build:app",
     "cf:build:app": "opennextjs-cloudflare build",
+    "cf:build:next": "next build --turbo",
     "cf:dev": "npm-run-all cf:schema cf:db:generate cf:migrate:local dev",
     "cf:preview": "npm-run-all cf:build cf:migrate:local && opennextjs-cloudflare preview",
     "cf:deploy": "npm-run-all cf:build cf:migrate:remote && opennextjs-cloudflare deploy",

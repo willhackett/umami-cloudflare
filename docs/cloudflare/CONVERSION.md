@@ -34,7 +34,7 @@ Upstream files with hooks (search for `umami-cloudflare` comments):
 | ------------------- | ---------------------------------------------------------------------------------------- |
 | `src/lib/db.ts`     | `D1` database type, `isD1()`, `runQuery` and `isRelationalOnly` accept D1               |
 | `src/lib/prisma.ts` | `getClient()` returns the lazy D1 client; `executeRawQuery()` delegates to `runD1RawQuery` |
-| `next.config.ts`    | `turbopack.resolveAlias` for the stubs + KV cache; `initOpenNextCloudflareForDev()`      |
+| `next.config.ts`    | `turbopack.resolveAlias` for the stubs + KV cache; `serverExternalPackages`; `initOpenNextCloudflareForDev()` |
 | `tsconfig.json`     | `paths` entry mapping `@/lib/redis` to the KV module                                     |
 | `package.json`      | `cf:*` scripts and the Cloudflare dependencies                                           |
 | `pnpm-workspace.yaml` | allow the `workerd` postinstall                                                        |
@@ -111,10 +111,23 @@ never reach the Worker bundle.
 
 ### Next.js on Workers
 
-`@opennextjs/cloudflare` builds the app (`opennextjs-cloudflare build`) and
+`@opennextjs/cloudflare` builds the app (`opennextjs-cloudflare build`). Its
+`buildCommand` is pinned to `pnpm cf:build:next` (a plain `next build`) because upstream's
+`build` script would regenerate the Postgres Prisma client and try to reach Postgres.
 `src/cloudflare/worker.ts` wraps the generated handler to add `cf-ipcity` /
-`cf-region-code` headers from `request.cf`, which upstream's `src/lib/detect.ts` already
-understands.
+`src/cloudflare/worker.ts` wraps the generated handler to add `cf-region-code` headers from `request.cf`, which upstream's `src/lib/detect.ts` already
+understands, and refuses to serve until `APP_SECRET` is configured.
+
+### Bundle size
+
+Workers allow 10 MiB (compressed) per script. Turbopack copies the server-side module
+graph reachable from `src/lib` into every route group chunk (about 30 copies for umami),
+which pushed the bundle to ~11 MiB. Large pure-JS server libraries (`zod`, the Prisma
+runtime, `jsonwebtoken`, ...) are therefore listed in `serverExternalPackages` so Next
+leaves them to OpenNext, which bundles each once. The result is ~6.3 MiB compressed.
+`date-fns` cannot be externalized (Next transpiles it). CI prints the size on every build
+(`wrangler deploy --dry-run`); if an upstream merge adds a big server dependency and the
+size creeps up, add it to that list.
 
 ## Merging upstream
 

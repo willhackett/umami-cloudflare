@@ -223,6 +223,28 @@ export default withNextIntl({
   turbopack: {
     resolveAlias: cloudflareAliases,
   },
+  // Turbopack copies the shared server graph into every route chunk; marking the big
+  // pure-JS server libraries as external lets OpenNext bundle each of them once.
+  serverExternalPackages: [
+    '@prisma/client',
+    '@prisma/adapter-d1',
+    'zod',
+    'semver',
+    'jsonwebtoken',
+    'debug',
+    'serialize-error',
+    'ua-parser-js',
+    'detect-browser',
+    'isbot',
+    'bcryptjs',
+    'otplib',
+    'uuid',
+    'ipaddr.js',
+    'is-localhost-ip',
+    'maxmind',
+    'jszip',
+    'papaparse',
+  ],
   devIndicators: {
     position: 'bottom-right',
   },

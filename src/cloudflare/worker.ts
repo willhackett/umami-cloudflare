@@ -44,8 +44,27 @@ function withGeoHeaders(request: Request): Request {
   return changed ? new Request(request, { headers }) : request;
 }
 
+const PLACEHOLDER_SECRETS = new Set(['', 'change-me-to-a-long-random-string', 'build-only-placeholder']);
+
+/**
+ * umami derives its signing secret from DATABASE_URL when APP_SECRET is missing. On
+ * Cloudflare DATABASE_URL is the constant `d1://DB`, so an unset secret would be
+ * guessable. Refuse to serve until `wrangler secret put APP_SECRET` has been run.
+ */
+function missingSecret(env: Record<string, unknown>): boolean {
+  const secret = env.APP_SECRET;
+  return typeof secret !== 'string' || PLACEHOLDER_SECRETS.has(secret) || secret.length < 16;
+}
+
 export default {
-  async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Record<string, unknown>, ctx: ExecutionContext): Promise<Response> {
+    if (missingSecret(env)) {
+      return new Response(
+        'umami-cloudflare: APP_SECRET is not configured. Run `wrangler secret put APP_SECRET` with a long random value.',
+        { status: 500, headers: { 'content-type': 'text/plain' } },
+      );
+    }
+
     return handler.fetch(withGeoHeaders(request), env, ctx);
   },
 } satisfies ExportedHandler;
