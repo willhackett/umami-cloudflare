@@ -657,6 +657,49 @@ describe('event & session data', () => {
 });
 
 describe('prisma ORM on D1', () => {
+  test('resetWebsite and deleteWebsite (raw delete ... using inside a transaction)', async () => {
+    const { uuid } = await import('@/lib/crypto');
+    const id = uuid();
+    await ctx.db
+      .prepare('insert into website (website_id, name, domain, created_at) values (?, ?, ?, ?)')
+      .bind(id, 'Doomed', 'doomed.test', '2024-01-01T00:00:00.000+00:00')
+      .run();
+    const sessionId = uuid();
+    await ctx.db
+      .prepare('insert into session (session_id, website_id, created_at) values (?, ?, ?)')
+      .bind(sessionId, id, '2024-01-01T00:00:00.000+00:00')
+      .run();
+    const eventId = uuid();
+    await ctx.db
+      .prepare(
+        'insert into website_event (event_id, website_id, session_id, visit_id, created_at, url_path, event_type) values (?, ?, ?, ?, ?, ?, 1)',
+      )
+      .bind(eventId, id, sessionId, uuid(), '2024-01-01T00:00:00.000+00:00', '/')
+      .run();
+    await ctx.db
+      .prepare(
+        'insert into event_data (event_data_id, website_id, website_event_id, data_key, data_type, string_value, created_at) values (?, ?, ?, ?, 1, ?, ?)',
+      )
+      .bind(uuid(), id, eventId, 'k', 'v', '2024-01-01T00:00:00.000+00:00')
+      .run();
+
+    await prismaQueries.resetWebsite(id);
+    const afterReset = await ctx.db
+      .prepare('select count(*) as n from website_event where website_id = ?')
+      .bind(id)
+      .first<{ n: number }>();
+    expect(afterReset?.n).toBe(0);
+    expect(await prismaQueries.getWebsite(id)).toBeTruthy();
+
+    await prismaQueries.deleteWebsite(id);
+    expect(await prismaQueries.getWebsite(id)).toBeNull();
+    const eventData = await ctx.db
+      .prepare('select count(*) as n from event_data where website_id = ?')
+      .bind(id)
+      .first<{ n: number }>();
+    expect(eventData?.n).toBe(0);
+  });
+
   test('crud through generated client', async () => {
     const website = await prismaQueries.getWebsite(WEBSITE_ID);
     expect(website?.name).toBe('Test site');

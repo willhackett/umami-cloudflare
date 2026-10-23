@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'vitest';
 import { getLocalTimeSQL, getOffsetSeconds, getZoneInfo, toCanonicalTimestamp } from './timezone';
-import { mapToCharFormat, regexToGlob, SqliteTranslateError, translateQuery } from './translate';
+import {
+  mapToCharFormat,
+  regexToGlob,
+  SqliteTranslateError,
+  translateQuery,
+  translateUnsafe,
+} from './translate';
 
 describe('translateQuery', () => {
   test('binds {{params}} positionally and converts dates', () => {
@@ -313,5 +319,29 @@ describe('helpers', () => {
     expect(toCanonicalTimestamp(new Date('2024-01-01T00:00:00Z'))).toBe(
       '2024-01-01T00:00:00.000+00:00',
     );
+  });
+});
+
+describe('raw statements with $N placeholders', () => {
+  test('delete ... using becomes delete where exists', () => {
+    const { sql, params } = translateUnsafe(
+      `
+      delete from event_data
+      using website_event
+      where event_data.website_event_id = website_event.event_id
+        and website_event.website_id = $1
+    `,
+      ['w1'],
+    );
+    expect(sql.replace(/\s+/g, ' ').trim()).toBe(
+      'delete from event_data where exists (select 1 from website_event where event_data.website_event_id = website_event.event_id and website_event.website_id = ?)',
+    );
+    expect(params).toEqual(['w1']);
+  });
+
+  test('repeated and out-of-order placeholders', () => {
+    const { sql, params } = translateUnsafe('select $2, $1, $2', ['a', 'b']);
+    expect(sql).toBe('select ?, ?, ?');
+    expect(params).toEqual(['b', 'a', 'b']);
   });
 });

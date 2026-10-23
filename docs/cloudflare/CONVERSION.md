@@ -86,6 +86,7 @@ sequence of small passes, each handling one Postgres construct upstream uses:
 | `jsonb_array_elements_text(x::jsonb) as t(value)`    | `json_each(x) as t` (guarded with `json_valid`)                |
 | `array_agg(x order by k)`                            | `json_group_array(x order by k)` + JSON.parse on the result    |
 | `percentile_cont(p) within group (order by x)`       | interpolation over `json_group_array(x order by x)`            |
+| `delete from a using b where …` and `$1` raw statements | `delete from a where exists (select 1 from b where …)`; Prisma `$executeRawUnsafe`/`$queryRawUnsafe` on the D1 client are translated too (`SET search_path` is a no-op) |
 | `mode() within group (order by x)`                   | `(select value from json_each(json_group_array(x)) ... order by count(*) desc limit 1)` |
 | `bool_or(x)`                                         | `max(x)`                                                       |
 | `regexp_replace(h, '^www.', '')`                     | `case when h like 'www_%' then substr(h, 5) else h end`        |

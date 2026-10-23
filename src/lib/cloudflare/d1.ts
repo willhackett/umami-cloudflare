@@ -9,7 +9,7 @@ import { PrismaD1 } from '@prisma/adapter-d1';
 import debug from 'debug';
 import { PrismaClient } from '@/generated/prisma/client';
 import { getD1Database } from './env';
-import { postProcessRows, translateQuery } from './sql/translate';
+import { postProcessRows, translateQuery, translateUnsafe } from './sql/translate';
 
 const log = debug('umami:d1');
 
@@ -38,27 +38,42 @@ export function resetD1Client() {
  * D1 has no interactive transactions. Batch transactions map onto D1 batch;
  * callback transactions run against the plain client (non-atomic).
  */
-async function emulatedTransaction(input: unknown, options?: unknown) {
-  const client = getRealClient();
-
+async function emulatedTransaction(proxy: PrismaClient, input: unknown, options?: unknown) {
   if (typeof input === 'function') {
-    return (input as (tx: unknown) => Promise<unknown>)(client);
+    // Hand the callback the proxy so raw statements inside it are translated too.
+    return (input as (tx: unknown) => Promise<unknown>)(proxy);
   }
+
+  const client = getRealClient();
 
   return (client.$transaction as (i: unknown, o?: unknown) => Promise<unknown>)(input, options);
 }
 
 /** A PrismaClient-shaped proxy that resolves the real client on first access. */
 export function createLazyD1Client(): PrismaClient {
-  return new Proxy({} as PrismaClient, {
+  const proxy: PrismaClient = new Proxy({} as PrismaClient, {
     get(_target, prop) {
       if (prop === '$transaction') {
-        return emulatedTransaction;
+        return (input: unknown, options?: unknown) => emulatedTransaction(proxy, input, options);
       }
 
       if (prop === 'then') {
         // never behave like a thenable
         return undefined;
+      }
+
+      // Upstream occasionally runs Postgres SQL straight through Prisma's raw
+      // methods (e.g. `delete ... using` in deleteWebsiteDependentData). Translate
+      // those the same way runD1RawQuery translates umami's {{param}} queries.
+      if (prop === '$executeRawUnsafe' || prop === '$queryRawUnsafe') {
+        return (sql: string, ...values: unknown[]) => {
+          if (/^\s*set\s+search_path\b/i.test(sql)) return Promise.resolve(0);
+          const { sql: translated, params } = translateUnsafe(sql, values);
+          const client = getRealClient();
+          return prop === '$executeRawUnsafe'
+            ? client.$executeRawUnsafe(translated, ...params)
+            : client.$queryRawUnsafe(translated, ...params);
+        };
       }
 
       const client = getRealClient();
@@ -67,6 +82,8 @@ export function createLazyD1Client(): PrismaClient {
       return typeof value === 'function' ? value.bind(client) : value;
     },
   });
+
+  return proxy;
 }
 
 /**

@@ -291,6 +291,18 @@ const JSON_EACH_GUARD = (expr: string) =>
   `json_each(case when json_valid(${expr}) then ${expr} else '[]' end)`;
 
 /** `cross join lateral jsonb_array_elements_text(x::jsonb) as t(value)` -> `cross join json_each(x) as t` */
+/**
+ * Postgres `delete from a using b where <cond>` -> `delete from a where exists
+ * (select 1 from b where <cond>)`. SQLite has no USING clause on DELETE.
+ */
+function passDeleteUsing(sql: string): string {
+  return sql.replace(
+    /\bdelete\s+from\s+([\w".]+)\s+using\s+([\w".]+(?:\s+(?:as\s+)?\w+)?)\s+where\b([\s\S]*?)(;?\s*)$/i,
+    (_m, target, using, cond, tail) =>
+      `delete from ${target} where exists (select 1 from ${using} where${cond})${tail}`,
+  );
+}
+
 function passJsonArray(sql: string): string {
   let out = sql.replace(/\bcross\s+join\s+lateral\b/gi, 'cross join');
 
@@ -1225,6 +1237,7 @@ export function translateQuery(sql: string, data: Record<string, unknown> = {}):
   const containsParams = new Set<string>();
 
   let out = sql;
+  out = passDeleteUsing(out);
   out = passJsonArray(out);
   out = passDistinctOn(out);
   out = passGroupingSets(out);
@@ -1273,4 +1286,20 @@ export function postProcessRows<T extends Record<string, unknown>>(
   }
 
   return rows;
+}
+
+/**
+ * Translate a Postgres statement written with Prisma's positional `$1` placeholders
+ * (as used by upstream's `$executeRawUnsafe` / `$queryRawUnsafe` calls) by mapping
+ * them onto `{{pN}}` placeholders and running the normal translation.
+ */
+export function translateUnsafe(sql: string, values: unknown[]): TranslatedQuery {
+  const data: Record<string, unknown> = {};
+  const withNamed = sql.replace(/\$(\d+)\b/g, (_m, n: string) => {
+    const key = `p${n}`;
+    data[key] = values[Number(n) - 1];
+    return `{{${key}}}`;
+  });
+
+  return translateQuery(withNamed, data);
 }
