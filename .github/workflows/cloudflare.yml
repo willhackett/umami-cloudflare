@@ -3,6 +3,7 @@ name: Cloudflare CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   DATABASE_URL: d1://DB
