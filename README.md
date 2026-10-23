@@ -1,147 +1,195 @@
-> **umami-cloudflare** — this fork runs umami entirely on Cloudflare (Workers + D1 + KV).
-> See [docs/cloudflare/README.md](docs/cloudflare/README.md) to deploy and
-> [docs/cloudflare/CONVERSION.md](docs/cloudflare/CONVERSION.md) for how the port works and how upstream is merged.
-
 <p align="center">
   <img src="https://content.umami.is/website/images/umami-logo.png" alt="Umami Logo" width="100">
 </p>
 
-<h1 align="center">Umami</h1>
+<h1 align="center">umami-cloudflare</h1>
 
 <p align="center">
-  <i>Umami is a privacy-first analytics platform. Traffic, campaigns, behavior, conversions, and revenue in one place — no cookies, no surveillance, self-hosted or in the cloud.</i>
+  <i><a href="https://umami.is">Umami</a>, the privacy-first analytics platform, running entirely on Cloudflare Workers, D1 and KV. No servers, no Postgres, no ClickHouse.</i>
 </p>
 
 <p align="center">
-  <a href="https://github.com/umami-software/umami/releases"><img src="https://img.shields.io/github/release/umami-software/umami.svg" alt="GitHub Release" /></a>
   <a href="https://github.com/umami-software/umami/blob/master/LICENSE"><img src="https://img.shields.io/github/license/umami-software/umami.svg" alt="MIT License" /></a>
-  <a href="https://github.com/umami-software/umami/actions"><img src="https://img.shields.io/github/actions/workflow/status/umami-software/umami/ci.yml" alt="Build Status" /></a>
-  <a href="https://cloud.umami.is/share/LGazGOecbDtaIwDr/umami.is" style="text-decoration: none;"><img src="https://img.shields.io/badge/Try%20Demo%20Now-Click%20Here-brightgreen" alt="Umami Demo" /></a>
+  <a href="https://github.com/umami-software/umami/releases"><img src="https://img.shields.io/badge/upstream-umami%20v3.4.0-blue" alt="Based on umami v3.4.0" /></a>
 </p>
 
 ---
 
-## 🚀 Getting Started
+## Credits
 
-A detailed getting started guide can be found at [umami.is/docs](https://umami.is/docs/).
+This project is a fork of **[Umami](https://github.com/umami-software/umami)** by
+[Umami Software, Inc.](https://umami.is) Umami is a simple, fast, privacy-focused alternative
+to Google Analytics: traffic, campaigns, behaviour, conversions and revenue, with no cookies
+and no surveillance. All of the product, the dashboard, the tracker, the reports and the
+data model are theirs, released under the [MIT License](LICENSE).
 
----
+This fork only changes *where it runs*. If you can use Umami on a server or on
+[Umami Cloud](https://cloud.umami.is), please do, and consider
+[supporting the project](https://umami.is). Bugs in the analytics itself belong
+[upstream](https://github.com/umami-software/umami/issues); bugs in the Cloudflare port
+belong here.
 
-## 🛠 Installing from Source
+## What this fork does
+
+| Umami needs        | Cloudflare service                                                  |
+| ------------------ | ------------------------------------------------------------------- |
+| Next.js app server | **Workers** via [OpenNext](https://opennext.js.org/cloudflare)      |
+| SQL database       | **D1** (SQLite) through Prisma's D1 adapter                         |
+| Static assets      | **Workers Static Assets**                                           |
+| Cache (optional)   | **Workers KV** (replaces Redis)                                     |
+| GeoIP              | **Cloudflare request geolocation** (replaces MaxMind)               |
+
+Everything upstream ships still works: dashboards, reports, funnels, journeys, retention,
+attribution, heatmaps, session replay, revenue, event data, teams, share links, API keys,
+two-factor auth and the MCP endpoint. Upstream's Postgres SQL is translated to SQLite at
+runtime, so upstream's query files are untouched and future Umami releases merge cleanly.
+How that works, and what the limits are, is in
+[docs/cloudflare/CONVERSION.md](docs/cloudflare/CONVERSION.md) and
+[docs/cloudflare/README.md](docs/cloudflare/README.md).
+
+## Deploy to Cloudflare
 
 ### Requirements
 
-- A server with Node.js version 18.18+.
-- A PostgreSQL database version v12.14+.
+- Node.js 22 and pnpm 12.
+- A Cloudflare account. The free plan works for small sites. Workers Paid is recommended
+  for anything real: on the free plan D1 is capped at 500 MB and 50 queries per request,
+  which some reports exceed.
+- Cloudflare's CLI, `wrangler`, is installed with the project dependencies.
 
-### Get the source code and install packages
+### 1. Get the code and log in
 
 ```bash
-git clone https://github.com/umami-software/umami.git
-cd umami
+git clone https://github.com/willhackett/umami-cloudflare.git
+cd umami-cloudflare
 pnpm install
+pnpm exec wrangler login
 ```
 
-### Configure Umami
-
-Create an `.env` file with the following:
+### 2. Create the database
 
 ```bash
-DATABASE_URL=connection-url
+pnpm exec wrangler d1 create umami
 ```
 
-Optional: set `API_URL` to change the base URL used by internal UI API calls.
-Relative paths are served under `BASE_PATH`; absolute URLs are proxied through the local `/api` route.
-For example, `API_URL=/internal-api` or `API_URL=https://api.example.com/api`.
+Copy the `database_id` it prints into `wrangler.jsonc`, replacing the zero UUID under
+`d1_databases`.
 
-Optional: set `TWO_FACTOR_ENCRYPTION_KEY` to a 64-character hex string to enable two-factor
-authentication. Generate one with `openssl rand -hex 32`. Two-factor authentication is unavailable
-and cannot be required until this key is set.
+### 3. Set the app secret
 
-MCP is disabled by default. Set `MCP_ENABLED=1` to enable the `/mcp` endpoint, then
-authenticate with an API key generated under Settings → API keys.
-
-The connection URL format:
+`APP_SECRET` signs login sessions and share tokens. Make it long and random.
 
 ```bash
-postgresql://username:mypassword@localhost:5432/mydb
+openssl rand -hex 32 | pnpm exec wrangler secret put APP_SECRET
 ```
 
-### Build the Application
+Optional secrets, set the same way: `TWO_FACTOR_ENCRYPTION_KEY` (64 hex characters,
+enables two-factor auth) and `MCP_ENABLED=1` as a plain var if you want the `/mcp`
+endpoint.
+
+### 4. Build, migrate and deploy
 
 ```bash
-pnpm run build
+pnpm cf:deploy
 ```
 
-The build step will create tables in your database if you are installing for the first time. It will also create a login user with username **admin** and password **umami**.
+This generates the SQLite Prisma schema and client, builds the tracker and session
+recorder, builds the Next.js app with OpenNext, applies the D1 migrations to your remote
+database and deploys the Worker. The command prints the Worker URL at the end.
 
-### Start the Application
+Log in at that URL with **admin** / **umami** and change the password immediately.
+
+### 5. Add a website
+
+In the dashboard, add your website and copy the tracking snippet. It points at your
+Worker URL, for example:
+
+```html
+<script defer src="https://umami.<your-subdomain>.workers.dev/script.js" data-website-id="..."></script>
+```
+
+### Optional
+
+- **Custom domain**: add a `routes` entry with `custom_domain: true` to `wrangler.jsonc`,
+  or attach a domain in the Cloudflare dashboard under the Worker's settings. Redeploy
+  afterwards.
+- **KV cache**: `pnpm exec wrangler kv namespace create CACHE`, then uncomment
+  `kv_namespaces` in `wrangler.jsonc` with the printed id. This replaces Redis for
+  website and session lookups. KV is eventually consistent, so only enable it if a
+  delay of up to a minute on new websites and logins is acceptable.
+- **Environment variables**: all of Umami's variables (`BASE_PATH`,
+  `TRACKER_SCRIPT_NAME`, `COLLECT_API_ENDPOINT`, `DISABLE_BOT_CHECK`, `IGNORE_IP`,
+  `REMOVE_TRAILING_SLASH`, and so on) go under `vars` in `wrangler.jsonc`. The full
+  table is in [docs/cloudflare/README.md](docs/cloudflare/README.md#environment-variables).
+- **Deploy from GitHub Actions**: add the repository secrets `CLOUDFLARE_API_TOKEN`
+  (Workers Scripts:Edit, D1:Edit, Workers KV:Edit, Account Settings:Read) and
+  `CLOUDFLARE_ACCOUNT_ID`, then run the **Deploy to Cloudflare** workflow. Set
+  `APP_SECRET` once with `wrangler secret put` first.
+
+## Migrating from an existing Umami installation
+
+Move your Postgres data into D1 in three commands. Upgrade the source Umami to the
+version this fork is based on first, so the schemas line up.
 
 ```bash
-pnpm run start
+pnpm cf:migrate:export --source postgresql://user:pass@host:5432/umami --out .wrangler/migration
+pnpm cf:migrate:remote
+pnpm cf:migrate:import --remote --dir .wrangler/migration --verify
 ```
 
-By default, this will launch the application on `http://localhost:3000`. You will need to either [proxy](https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/) requests from your web server or change the [port](https://nextjs.org/docs/api-reference/cli#production) to serve the application directly.
+The export derives the table list from the generated SQLite schema, streams rows out of
+Postgres and converts timestamps, booleans, decimals and JSON. The import loads the files
+through `wrangler` and compares per-table row counts. Statements are `INSERT OR REPLACE`,
+so re-running is safe. Website ids and the tracker script are unchanged, so existing
+embeds keep working once you switch the script URL to the Worker.
 
----
+D1 databases are limited to 10 GB. The export prints the source size and warns above
+that limit. Use `--exclude session_replay,heatmap_event` to leave out bulky tables. See
+[docs/cloudflare/README.md](docs/cloudflare/README.md#migrating-an-existing-umami-installation)
+for the details.
 
-## 🐳 Installing with Docker
-
-Umami provides Docker images as well as a Docker compose file for easy deployment.
-
-Docker image:
-
-```bash
-docker pull docker.umami.is/umami-software/umami:latest
-```
-
-Docker compose (Runs Umami with a PostgreSQL database):
-
-```bash
-docker compose up -d
-```
-
----
-
-## 🔄 Getting Updates
-
-To get the latest features, simply do a pull, install any new dependencies, and rebuild:
+## Updating
 
 ```bash
 git pull
 pnpm install
-pnpm build
+pnpm cf:deploy
 ```
 
-To update the Docker image, simply pull the new images and rebuild:
+New D1 migrations are applied as part of the deploy.
+
+## Local development
 
 ```bash
-docker compose pull
-docker compose up --force-recreate -d
+cp .env.cloudflare.example .env
+pnpm cf:dev        # next dev against a local D1, migrations applied automatically
+pnpm cf:preview    # the real OpenNext build running in workerd
+pnpm cf:test       # translator unit tests + every query executed against local D1
 ```
 
----
+## Keeping up with upstream
 
-## 🛟 Support
+`pnpm cf:sync` fetches and merges `umami-software/umami`, regenerates the SQLite schema
+and creates a D1 migration if the schema moved. The conversion lives in
+`src/lib/cloudflare/`, `src/cloudflare/`, `scripts/cloudflare/` and `prisma/migrations-d1/`,
+with a handful of marked hooks in upstream files. The full list and the merge checklist
+are in [docs/cloudflare/CONVERSION.md](docs/cloudflare/CONVERSION.md).
 
-<p align="center">
-  <a href="https://github.com/umami-software/umami"><img src="https://img.shields.io/badge/GitHub--blue?style=social&logo=github" alt="GitHub" /></a>
-  <a href="https://twitter.com/umami_software"><img src="https://img.shields.io/badge/Twitter--blue?style=social&logo=twitter" alt="Twitter" /></a>
-  <a href="https://linkedin.com/company/umami-software"><img src="https://img.shields.io/badge/LinkedIn--blue?style=social&logo=linkedin" alt="LinkedIn" /></a>
-  <a href="https://umami.is/discord"><img src="https://img.shields.io/badge/Discord--blue?style=social&logo=discord" alt="Discord" /></a>
-</p>
+## Limits
 
-[release-shield]: https://img.shields.io/github/release/umami-software/umami.svg
-[releases-url]: https://github.com/umami-software/umami/releases
-[license-shield]: https://img.shields.io/github/license/umami-software/umami.svg
-[license-url]: https://github.com/umami-software/umami/blob/master/LICENSE
-[build-shield]: https://img.shields.io/github/actions/workflow/status/umami-software/umami/ci.yml
-[build-url]: https://github.com/umami-software/umami/actions
-[github-shield]: https://img.shields.io/badge/GitHub--blue?style=social&logo=github
-[github-url]: https://github.com/umami-software/umami
-[twitter-shield]: https://img.shields.io/badge/Twitter--blue?style=social&logo=twitter
-[twitter-url]: https://twitter.com/umami_software
-[linkedin-shield]: https://img.shields.io/badge/LinkedIn--blue?style=social&logo=linkedin
-[linkedin-url]: https://linkedin.com/company/umami-software
-[discord-shield]: https://img.shields.io/badge/Discord--blue?style=social&logo=discord
-[discord-url]: https://discord.com/invite/4dz4zcXYrQ
+The things that differ from Umami on Postgres, in short:
+
+- D1: 10 GB per database, single-threaded, roughly 1,000 simple queries per second.
+- Contains and search filters are ASCII case-insensitive rather than Unicode.
+- Regex filters are compiled to SQLite `GLOB`. Anchors, classes, groups, alternation and
+  bounded repetition work. Lookaround and back-references do not.
+- Timezone handling uses an offset table generated at build time, exact from 2015 to two
+  years ahead.
+- ClickHouse, Kafka, Redis, Postgres read replicas and Docker are not supported.
+
+The full list with reasons is in
+[docs/cloudflare/README.md](docs/cloudflare/README.md#limits-and-differences).
+
+## License
+
+MIT, the same as Umami. See [LICENSE](LICENSE).

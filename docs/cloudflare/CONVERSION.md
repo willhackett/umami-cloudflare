@@ -39,7 +39,7 @@ Upstream files with hooks (search for `umami-cloudflare` comments):
 | `package.json`      | `cf:*` scripts and the Cloudflare dependencies                                           |
 | `pnpm-workspace.yaml` | allow the `workerd` postinstall                                                        |
 | `.gitignore`        | `.open-next`, `.wrangler`, `.dev.vars`, `cloudflare-env.d.ts`                            |
-| `README.md`         | pointer to this documentation                                                            |
+| `README.md`         | replaced: fork README with credits, deploy and migration instructions (upstream README changes are not merged) |
 
 Nothing under `src/queries/`, `src/app/`, `src/components/` or `prisma/schema.prisma`
 is modified.
