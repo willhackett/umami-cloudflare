@@ -39,7 +39,11 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['tests/cloudflare/**/*.test.ts', 'src/lib/cloudflare/**/*.test.ts'],
+    include: [
+      'tests/cloudflare/**/*.test.ts',
+      'src/lib/cloudflare/**/*.test.ts',
+      'scripts/cloudflare/**/*.test.ts',
+    ],
     testTimeout: 120_000,
     hookTimeout: 120_000,
     fileParallelism: false,

@@ -53,6 +53,56 @@ jobs:
       - run: pnpm generate:db:client
       - run: pnpm test
 
+  migration:
+    name: Postgres -> D1 migration (export, import, verify)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: umami
+          POSTGRES_PASSWORD: umami
+          POSTGRES_DB: umami
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U umami"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SOURCE_DATABASE_URL: postgresql://umami:umami@localhost:5432/umami
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Prepare a source umami database (upstream schema + demo data)
+        env:
+          DATABASE_URL: postgresql://umami:umami@localhost:5432/umami
+        run: |
+          pnpm generate:db:client
+          pnpm db:migrate
+          pnpm db:seed --days 2
+      - name: Export Postgres to D1 SQL files
+        run: pnpm cf:migrate:export --out .wrangler/migration
+      - name: Apply the D1 schema locally and import
+        run: |
+          pnpm cf:schema
+          pnpm cf:migrate:local
+          pnpm cf:migrate:import --local --dir .wrangler/migration --verify
+      - name: Migrated data is queryable through the Cloudflare runtime
+        run: |
+          pnpm cf:db:generate
+          pnpm cf:typegen
+          pnpm cf:test -- tests/cloudflare/migrated-data.test.ts
+
   build:
     name: OpenNext build for Workers
     runs-on: ubuntu-latest

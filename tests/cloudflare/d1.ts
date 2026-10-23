@@ -42,18 +42,27 @@ export async function applyMigrations(db: D1Database) {
   }
 }
 
-export async function startD1(): Promise<D1TestContext> {
+export interface StartD1Options {
+  /**
+   * Use the persisted local D1 state that `wrangler dev` / `wrangler d1 execute --local`
+   * write to `.wrangler/state` (migrations are expected to be applied already) instead
+   * of a fresh in-memory database.
+   */
+  persist?: boolean;
+}
+
+export async function startD1({ persist = false }: StartD1Options = {}): Promise<D1TestContext> {
   process.env.DATABASE_URL = 'd1://DB';
   process.env.APP_SECRET ||= 'test-secret';
   process.env.SKIP_DB_CHECK = '1';
 
   const proxy: PlatformProxy<UmamiCloudflareEnv> = await getPlatformProxy<UmamiCloudflareEnv>({
     configPath: path.join(root, 'wrangler.jsonc'),
-    persist: false,
+    persist: persist ? { path: path.join(root, '.wrangler/state/v3') } : false,
   });
 
   const env = proxy.env;
-  await applyMigrations(env.DB);
+  if (!persist) await applyMigrations(env.DB);
 
   resetD1Client();
   setCloudflareEnv(env);

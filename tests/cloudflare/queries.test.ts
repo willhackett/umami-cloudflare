@@ -290,6 +290,15 @@ describe('stats', () => {
     const list: any = await sql.getWebsiteStats(WEBSITE_ID, filters({ path: 'eq./,/pricing' }));
     expect(Number(list.pageviews)).toBe(3);
 
+    const longContains: any = await sql.getWebsiteStats(
+      WEBSITE_ID,
+      filters({ path: `c.${'x'.repeat(80)}` }),
+    );
+    expect(Number(longContains.pageviews)).toBe(0);
+
+    const contains: any = await sql.getWebsiteStats(WEBSITE_ID, filters({ path: 'c.PRIC' }));
+    expect(Number(contains.pageviews)).toBe(1);
+
     const longList = Array.from({ length: 300 }, (_, i) => `/nope-${i}`).concat('/signup');
     const many: any = await sql.getWebsiteStats(
       WEBSITE_ID,

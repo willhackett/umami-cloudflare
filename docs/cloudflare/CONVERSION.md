@@ -18,12 +18,12 @@ src/lib/cloudflare/
   sql/translate.test.ts
   stubs/*.ts             # @clickhouse/client, kafkajs, maxmind, redis, @prisma/adapter-pg, is-localhost-ip
 src/cloudflare/worker.ts # Worker entry: wraps OpenNext handler, injects geo headers
-scripts/cloudflare/      # schema derivation, D1 migration diff, upstream sync
+scripts/cloudflare/      # schema derivation, D1 migration diff, upstream sync, Postgres -> D1 export/import
 prisma/schema.sqlite.prisma   # GENERATED from prisma/schema.prisma (pnpm cf:schema)
 prisma/migrations-d1/         # D1 migrations (wrangler format)
 prisma.cloudflare.config.ts
 wrangler.jsonc, open-next.config.ts, vitest.cloudflare.config.ts
-tests/cloudflare/        # D1 integration test running every query
+tests/cloudflare/        # D1 integration test running every query; queries over migrated data
 .github/workflows/cloudflare*.yml
 docs/cloudflare/
 ```
@@ -71,9 +71,10 @@ sequence of small passes, each handling one Postgres construct upstream uses:
 
 | Postgres                                            | SQLite                                                         |
 | --------------------------------------------------- | -------------------------------------------------------------- |
-| `{{p}}`, `{{p::uuid}}`, `$1`                         | `?` positional binding; arrays expand to `(?, ?, ...)`           |
-| `= ANY({{p}})`, `!= ALL({{p}})`                      | `in (...)`, `not in (...)`                                     |
-| `ilike`, `~*`, `!~*`                                 | `like`, `like` (regex converted or rejected)                   |
+| `{{p}}`, `{{p::uuid}}`, `$1`                         | `?` positional binding; arrays bound as one JSON parameter     |
+| `= ANY({{p}})`, `!= ALL({{p}})`                      | `in (select value from json_each(?))`, `not in (...)`          |
+| `col ilike {{p}}` with a `%text%` value              | `instr(lower(col), ?) > 0` (no 50-byte pattern limit); else `like` |
+| `col ~* {{p}}`, `col !~* {{p}}`                      | `(lower(col) glob ? or ...)`: regex compiled to GLOB patterns  |
 | `x::int`, `::bigint`, `::float`, `::date`, `::uuid`  | `cast(x as integer/real)`, `date(x)`, stripped                 |
 | `at time zone 'Z'`                                   | `datetime(unixepoch(x) + <offset case expr>, 'unixepoch')`     |
 | `date_trunc('unit', x)`                              | `datetime(x, 'start of day')`, `strftime(...)`                 |
@@ -85,7 +86,7 @@ sequence of small passes, each handling one Postgres construct upstream uses:
 | `jsonb_array_elements_text(x::jsonb) as t(value)`    | `json_each(x) as t` (guarded with `json_valid`)                |
 | `array_agg(x order by k)`                            | `json_group_array(x order by k)` + JSON.parse on the result    |
 | `percentile_cont(p) within group (order by x)`       | interpolation over `json_group_array(x order by x)`            |
-| `mode() within group (order by x)`                   | `max(x)`                                                       |
+| `mode() within group (order by x)`                   | `(select value from json_each(json_group_array(x)) ... order by count(*) desc limit 1)` |
 | `bool_or(x)`                                         | `max(x)`                                                       |
 | `regexp_replace(h, '^www.', '')`                     | `case when h like 'www_%' then substr(h, 5) else h end`        |
 | `select distinct on (k) ... order by k, o`           | `row_number() over (partition by k order by o) = 1`            |
@@ -147,8 +148,12 @@ schema changed, writes a new D1 migration. Then:
    If upstream added a new query file, add a call to it in `tests/cloudflare/queries.test.ts`.
 3. If upstream added a redis method, add it to `src/lib/cloudflare/redis.ts` (TypeScript
    will tell you).
-4. Push; CI runs the tests, upstream's unit tests, and a full OpenNext build with a
-   dry-run deploy that reports the bundle size.
+4. If upstream added a Postgres migration, nothing else is needed for data migration:
+   `scripts/cloudflare/pg-to-d1.ts` derives its table and column list from the
+   generated SQLite schema, so new columns are exported automatically.
+5. Push; CI runs the tests, upstream's unit tests, a Postgres -> D1 migration round trip
+   against a seeded database, and a full OpenNext build with a dry-run deploy that
+   reports the bundle size.
 
 ## Design notes
 

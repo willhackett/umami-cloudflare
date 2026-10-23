@@ -826,8 +826,28 @@ function passOperators(
   data: Record<string, unknown>,
   listParams: Set<string>,
   regexParams: Map<string, string[]>,
+  containsParams: Set<string>,
 ): string {
   let out = sql;
+
+  // `col ilike {{p}}` where the bound value is `%text%` (umami's contains/search
+  // filters) becomes `instr(lower(col), lower(text)) > 0`: same result, but free of
+  // D1's 50-byte LIKE/GLOB pattern limit. Other ilike uses fall back to `like`.
+  const ilikeRe = /\b(not\s+)?ilike\s+\{\{\s*(\w+)[^}]*\}\}/gi;
+  let im: RegExpExecArray | null = ilikeRe.exec(out);
+  while (im) {
+    const [whole, not, name] = im;
+    const value = data[name];
+    if (typeof value === 'string' && /^%[^%_]+%$/.test(value)) {
+      const start = operandStart(out, im.index);
+      const column = out.slice(start, im.index).trim();
+      containsParams.add(name);
+      const replacement = `instr(lower(${column}), {{${name}::contains}}) ${not ? '=' : '>'} 0`;
+      out = out.slice(0, start) + replacement + out.slice(im.index + whole.length);
+      ilikeRe.lastIndex = start + replacement.length;
+    }
+    im = ilikeRe.exec(out);
+  }
 
   out = out.replace(/\bnot\s+ilike\b/gi, 'not like').replace(/\bilike\b/gi, 'like');
 
@@ -879,6 +899,8 @@ function passOperators(
 // Parameters
 // ---------------------------------------------------------------------------
 
+/** D1 rejects LIKE/GLOB patterns longer than this ("pattern too complex"). */
+export const D1_MAX_PATTERN_BYTES = 50;
 /** Hard cap on the number of GLOB patterns one regex may expand to. */
 const MAX_GLOB_PATTERNS = 64;
 /** Upper bound used when expanding unbounded repetition (`+`, `*`, `{n,}`). */
@@ -898,9 +920,10 @@ const ANCHOR_END = '\u0002';
  * bound. Anything else throws a SqliteTranslateError.
  */
 export function regexToGlob(pattern: string): string[] {
-  const alternatives = new RegexGlobCompiler(pattern).compile();
+  const compiler = new RegexGlobCompiler(pattern);
+  const alternatives = compiler.compile();
 
-  return alternatives.map(alt => {
+  const globs = alternatives.map(alt => {
     let glob = alt;
     let anchoredStart = false;
     let anchoredEnd = false;
@@ -919,10 +942,24 @@ export function regexToGlob(pattern: string): string[] {
     const suffix = anchoredEnd || glob.endsWith('*') ? '' : '*';
     return `${prefix}${glob}${suffix}`.toLowerCase();
   });
+
+  // D1 rejects patterns above 50 bytes. Variants produced by unbounded repetition
+  // (`+`, `*`, `{n,}`) that do not fit are dropped: the match is then exact up to the
+  // number of repeats that fits. Anything else over the limit is an error.
+  const fitting = globs.filter(g => Buffer.byteLength(g) <= D1_MAX_PATTERN_BYTES);
+  if (fitting.length < globs.length && (!compiler.unbounded || fitting.length === 0)) {
+    const longest = Math.max(...globs.map(g => Buffer.byteLength(g)));
+    throw new SqliteTranslateError(
+      `Regex filter expands to a ${longest}-byte pattern; Cloudflare D1 allows at most ${D1_MAX_PATTERN_BYTES}. Shorten the pattern or use "contains".`,
+    );
+  }
+  return fitting;
 }
 
 class RegexGlobCompiler {
   private pos = 0;
+  /** Set when the pattern used `+`, `*` or `{n,}` (expansion is bounded at MAX_REPEAT). */
+  unbounded = false;
 
   constructor(private readonly src: string) {}
 
@@ -1052,10 +1089,12 @@ class RegexGlobCompiler {
     if (ch === '*') {
       min = 0;
       max = MAX_REPEAT;
+      this.unbounded = true;
       this.pos++;
     } else if (ch === '+') {
       min = 1;
       max = MAX_REPEAT;
+      this.unbounded = true;
       this.pos++;
     } else if (ch === '?') {
       min = 0;
@@ -1066,6 +1105,7 @@ class RegexGlobCompiler {
       if (!m) throw new SqliteTranslateError('Unsupported {} quantifier in regex');
       min = Number(m[1]);
       max = m[2] ? (m[3] ? Number(m[3]) : min + MAX_REPEAT - 1) : min;
+      if (m[2] && !m[3]) this.unbounded = true;
       if (max < min) throw new SqliteTranslateError('Invalid {} quantifier in regex');
       this.pos += m[0].length;
     } else {
@@ -1140,11 +1180,17 @@ function passParams(
   data: Record<string, unknown>,
   listParams: Set<string>,
   regexParams: Map<string, string[]>,
+  containsParams: Set<string>,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
 
   const out = sql.replace(/\{\{\s*(\w+)(?:::(\w+))?\s*\}\}/g, (_, name, type) => {
     const value = data[name];
+
+    if (type === 'contains' && containsParams.has(name)) {
+      params.push(String(value).slice(1, -1).toLowerCase());
+      return '?';
+    }
 
     const globMatch = /^glob(\d+)$/.exec(type ?? '');
     if (globMatch) {
@@ -1176,6 +1222,7 @@ export function translateQuery(sql: string, data: Record<string, unknown> = {}):
   const jsonColumns: string[] = [];
   const listParams = new Set<string>();
   const regexParams = new Map<string, string[]>();
+  const containsParams = new Set<string>();
 
   let out = sql;
   out = passJsonArray(out);
@@ -1192,9 +1239,9 @@ export function translateQuery(sql: string, data: Record<string, unknown> = {}):
   out = passColonCasts(out);
   out = passDateDiff(out);
   out = passCast(out);
-  out = passOperators(out, data, listParams, regexParams);
+  out = passOperators(out, data, listParams, regexParams, containsParams);
 
-  const { sql: finalSql, params } = passParams(out, data, listParams, regexParams);
+  const { sql: finalSql, params } = passParams(out, data, listParams, regexParams, containsParams);
 
   if (params.length > D1_MAX_PARAMS) {
     throw new SqliteTranslateError(

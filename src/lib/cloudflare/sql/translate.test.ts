@@ -43,19 +43,34 @@ describe('translateQuery', () => {
     expect(JSON.parse(params[0] as string)).toHaveLength(500);
   });
 
-  test('ilike -> like, regex -> glob', () => {
+  test('contains (ilike %x%) -> instr, regex -> glob', () => {
     const { sql, params } = translateQuery(
       'where a ilike {{s}} and b not ilike {{s}} and website_event.url_path ~* {{r}} and d !~* {{r}}',
       {
-        s: '%x%',
+        s: '%X y%',
         r: '^/blog/.*',
       },
     );
 
     expect(sql).toBe(
-      'where a like ? and b not like ? and (lower(website_event.url_path) glob ?) and not (lower(d) glob ?)',
+      'where instr(lower(a), ?) > 0 and instr(lower(b), ?) = 0 and (lower(website_event.url_path) glob ?) and not (lower(d) glob ?)',
     );
-    expect(params).toEqual(['%x%', '%x%', '/blog/*', '/blog/*']);
+    expect(params).toEqual(['x y', 'x y', '/blog/*', '/blog/*']);
+  });
+
+  test('ilike with other patterns stays like', () => {
+    const { sql, params } = translateQuery('where a ilike {{s}} and b ilike {{t}}', {
+      s: 'x%',
+      t: '%a_b%',
+    });
+
+    expect(sql).toBe('where a like ? and b like ?');
+    expect(params).toEqual(['x%', '%a_b%']);
+  });
+
+  test('regex patterns longer than 50 bytes are rejected', () => {
+    expect(() => regexToGlob(`^/${'a'.repeat(60)}`)).toThrow(/at most 50/);
+    expect(() => regexToGlob(`^/${'a'.repeat(60)}\\d+`)).toThrow(/at most 50/);
   });
 
   test('regex alternation expands to several glob clauses', () => {
@@ -261,14 +276,16 @@ describe('helpers', () => {
       '/post/[0-9][0-9]',
       '/post/[0-9][0-9][0-9]',
     ]);
-    expect(regexToGlob('^/post/\\d+$')).toHaveLength(12);
+    // unbounded repetition is expanded as far as D1's 50-byte pattern limit allows
+    expect(regexToGlob('^/post/\\d+$')).toHaveLength(8);
+    expect(regexToGlob('^/post/\\d+$').at(-1)).toBe(`/post/${'[0-9]'.repeat(8)}`);
     expect(regexToGlob('^[A-Z][a-z]+$')[0]).toBe('[a-z][a-z]');
     expect(regexToGlob('a*b')).toContain('*b*');
     expect(regexToGlob('a*b')).toContain('*ab*');
     expect(regexToGlob('[^/]+')).toContain('*[^/]*');
     expect(regexToGlob('q=\\*')).toEqual(['*q=[*]*']);
     expect(regexToGlob('^/[?]x')).toEqual(['/[?]x*']);
-    expect(regexToGlob('\\s+')).toHaveLength(12);
+    expect(regexToGlob('\\s+')).toHaveLength(8);
     expect(() => regexToGlob('a(?=b)')).toThrow(SqliteTranslateError);
     expect(() => regexToGlob('(a|b|c|d){4}')).toThrow(/too complex/);
     expect(() => regexToGlob('a^b')).toThrow(SqliteTranslateError);
