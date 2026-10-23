@@ -295,5 +295,8 @@ export default withNextIntl({
   },
 });
 
-// umami-cloudflare: expose Cloudflare bindings (D1, KV) to `next dev`.
-initOpenNextCloudflareForDev();
+// umami-cloudflare: expose Cloudflare bindings (D1, KV) to `next dev`. Only there:
+// importing this config from vitest (upstream's routing tests) must not boot wrangler.
+if (process.env.NODE_ENV === 'development') {
+  initOpenNextCloudflareForDev();
+}
