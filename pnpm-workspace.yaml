@@ -10,10 +10,13 @@ allowBuilds:
   msw: false
   prisma: true
   sharp: false
+  workerd: true
 minimumReleaseAgeExclude:
   - '@umami/react-zen'
   - cn@0.2.6
   - '@umami/api-client@0.81.0'
+  - miniflare@5.20261019.2-beta
+  - wrangler@4.152.0
 
 # Security floors for transitive dependencies whose parents still allow affected versions.
 overrides:

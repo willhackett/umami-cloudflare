@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `wrangler dev` / `opennextjs-cloudflare preview`.
+# `next dev` reads .env instead (see .env.cloudflare.example).
+NEXTJS_ENV=development
+DATABASE_URL=d1://DB
+APP_SECRET=change-me-to-a-long-random-string
+SKIP_DB_CHECK=1
+DISABLE_TELEMETRY=1

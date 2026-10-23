@@ -1,0 +1,39 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "umami",
+  "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "umami",
+      // Replace with the id printed by `wrangler d1 create umami`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "prisma/migrations-d1"
+    }
+  ],
+  // Optional: bind a KV namespace as CACHE to enable umami's lookup/session cache
+  // (replaces Redis). See docs/cloudflare/README.md for the consistency caveat.
+  // "kv_namespaces": [{ "binding": "CACHE", "id": "..." }],
+  "services": [
+    {
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "umami"
+    }
+  ],
+  "vars": {
+    // Tells umami to use the D1 binding named after the URL host (DB).
+    "DATABASE_URL": "d1://DB",
+    "SKIP_DB_CHECK": "1",
+    "DISABLE_TELEMETRY": "1"
+    // APP_SECRET must be set as a secret: `wrangler secret put APP_SECRET`
+  }
+}
