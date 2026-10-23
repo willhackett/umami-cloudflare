@@ -1,0 +1,42 @@
+name: Deploy to Cloudflare
+
+# Manual deploy. Requires repository secrets:
+#   CLOUDFLARE_API_TOKEN  (Workers Scripts:Edit, D1:Edit, Workers KV:Edit, Account Settings:Read)
+#   CLOUDFLARE_ACCOUNT_ID
+# and the Worker secret APP_SECRET set once via `wrangler secret put APP_SECRET`.
+on:
+  workflow_dispatch:
+
+env:
+  DATABASE_URL: d1://DB
+  APP_SECRET: build-only-placeholder
+  SKIP_DB_CHECK: 1
+  SKIP_BUILD_GEO: 1
+  DISABLE_TELEMETRY: 1
+  NEXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm cf:build
+      - name: Apply D1 migrations
+        run: pnpm cf:migrate:remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Deploy Worker
+        run: pnpm exec opennextjs-cloudflare deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

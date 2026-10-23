@@ -1,0 +1,73 @@
+name: Cloudflare CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  DATABASE_URL: d1://DB
+  APP_SECRET: ci-only-secret
+  SKIP_DB_CHECK: 1
+  SKIP_BUILD_GEO: 1
+  DISABLE_TELEMETRY: 1
+  NEXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  test:
+    name: Translator + D1 integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Generated SQLite schema is up to date
+        run: pnpm cf:schema:check
+      - run: pnpm cf:db:generate
+      - run: pnpm cf:typegen
+      - run: pnpm cf:test
+
+  upstream-tests:
+    name: Upstream unit tests (Postgres client)
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://user:pass@localhost:5432/dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm generate:db:client
+      - run: pnpm test
+
+  build:
+    name: OpenNext build for Workers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm cf:build
+      - name: Bundle size (dry-run deploy)
+        run: pnpm exec wrangler deploy --dry-run --outdir .wrangler/dist
+      - name: Report sizes
+        run: du -sh .open-next .wrangler/dist && ls -la .wrangler/dist | head -20
