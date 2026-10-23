@@ -28,6 +28,10 @@ const SCHEMA_PATH = path.join(ROOT, 'prisma/schema.sqlite.prisma');
 
 // D1 limits: 100 KB per statement, 5 GB per imported file.
 const MAX_STATEMENT_BYTES = 90_000;
+// A single literal (a session replay blob, a long JSON value) can be bigger than a
+// statement is allowed to be. Such values are inserted in slices: the row goes in
+// with the first slice and the rest is appended with `col = col || <slice>`.
+export const MAX_LITERAL_BYTES = 80_000;
 const FETCH_SIZE = 2_000;
 
 const SCALAR_TYPES = new Set([
@@ -50,6 +54,8 @@ export interface Column {
 export interface Table {
   name: string;
   columns: Column[];
+  /** Column names of the primary key (needed to append slices of wide values). */
+  primaryKey: string[];
 }
 
 export interface Manifest {
@@ -75,6 +81,8 @@ export function parsePrismaSchema(src: string): Table[] {
   for (const match of src.matchAll(/model\s+(\w+)\s*\{([\s\S]*?)\n\}/g)) {
     const [, modelName, body] = match;
     const columns: Column[] = [];
+    const columnByField = new Map<string, string>();
+    const idFields: string[] = [];
     let tableName = modelName;
 
     for (const raw of body.split('\n')) {
@@ -86,6 +94,11 @@ export function parsePrismaSchema(src: string): Table[] {
         tableName = mapTable[1];
         continue;
       }
+      const compoundId = /^@@id\(\[([^\]]+)\]/.exec(line);
+      if (compoundId) {
+        idFields.push(...compoundId[1].split(',').map(f => f.trim()));
+        continue;
+      }
       if (line.startsWith('@@')) continue;
 
       const field = /^(\w+)\s+(\w+)(\[\])?\??(?:\s|$)/.exec(line);
@@ -94,13 +107,102 @@ export function parsePrismaSchema(src: string): Table[] {
       if (isList || !SCALAR_TYPES.has(type) || line.includes('@relation(')) continue;
 
       const mapColumn = /@map\("([^"]+)"\)/.exec(line);
-      columns.push({ name: mapColumn ? mapColumn[1] : fieldName, type });
+      const columnName = mapColumn ? mapColumn[1] : fieldName;
+      columns.push({ name: columnName, type });
+      columnByField.set(fieldName, columnName);
+      if (/\s@id\b/.test(` ${line}`)) idFields.push(fieldName);
     }
 
-    tables.push({ name: tableName, columns });
+    tables.push({
+      name: tableName,
+      columns,
+      primaryKey: idFields.map(f => columnByField.get(f) ?? f),
+    });
   }
 
   return tables;
+}
+
+/**
+ * Split a value whose SQLite literal would exceed `maxBytes` into literals that
+ * each fit. Text slices are appended with `col || slice`. Blob slices after the
+ * first are hex *strings*, appended with `unhex(hex(col) || slice)`, because
+ * SQLite's `||` turns blobs into text and truncates at the first NUL byte.
+ * Values that fit come back as a single literal.
+ */
+export function sliceLiteral(value: unknown, type: string, maxBytes = MAX_LITERAL_BYTES): string[] {
+  const whole = toSqliteLiteral(value, type);
+  if (Buffer.byteLength(whole) <= maxBytes) return [whole];
+
+  if (type === 'Bytes') {
+    const hex = Buffer.from(value as Uint8Array).toString('hex');
+    // keep slices on byte boundaries (two hex digits each)
+    const step = Math.max(2, Math.floor((maxBytes - 3) / 2) * 2);
+    const out: string[] = [];
+    for (let i = 0; i < hex.length; i += step) {
+      out.push(i === 0 ? `X'${hex.slice(i, i + step)}'` : `'${hex.slice(i, i + step)}'`);
+    }
+    return out;
+  }
+
+  // text (String / Json): cut on code points, counting the doubled quotes
+  const text = type === 'Json' && typeof value !== 'string' ? JSON.stringify(value) : String(value);
+  const out: string[] = [];
+  let piece = '';
+  let bytes = 0;
+  for (const ch of text) {
+    const size = ch === "'" ? 2 : Buffer.byteLength(ch);
+    if (bytes + size > maxBytes - 2 && piece) {
+      out.push(quote(piece));
+      piece = '';
+      bytes = 0;
+    }
+    piece += ch;
+    bytes += size;
+  }
+  if (piece || !out.length) out.push(quote(piece));
+  return out;
+}
+
+/**
+ * The statements for one row: a VALUES tuple when every literal fits in a
+ * statement, otherwise an INSERT carrying the first slice of each wide value and
+ * UPDATEs appending the remaining slices (all small enough for D1 on their own).
+ */
+export function rowStatements(
+  table: Table,
+  columns: Column[],
+  row: unknown[],
+  header: string,
+): { tuple: string } | { statements: string[] } {
+  const slices = row.map((v, i) => sliceLiteral(v, columns[i].type));
+  if (slices.every(s => s.length === 1)) {
+    return { tuple: `(${slices.map(s => s[0]).join(', ')})` };
+  }
+
+  if (!table.primaryKey.length) {
+    throw new Error(
+      `${table.name}: a value is too large for one D1 statement and the table has no primary key to append to`,
+    );
+  }
+  const where = table.primaryKey
+    .map(pk => {
+      const i = columns.findIndex(c => c.name === pk);
+      if (i < 0) throw new Error(`${table.name}: primary key column ${pk} not exported`);
+      return `"${pk}" = ${slices[i][0]}`;
+    })
+    .join(' and ');
+
+  const statements = [`${header}(${slices.map(s => s[0]).join(', ')});\n`];
+  slices.forEach((parts, i) => {
+    const col = `"${columns[i].name}"`;
+    for (const part of parts.slice(1)) {
+      const appended =
+        columns[i].type === 'Bytes' ? `unhex(hex(${col}) || ${part})` : `${col} || ${part}`;
+      statements.push(`UPDATE "${table.name}" SET ${col} = ${appended} WHERE ${where};\n`);
+    }
+  });
+  return { statements };
 }
 
 /** Quote a value as a SQLite literal. */
@@ -224,13 +326,21 @@ class SqlFileWriter {
   ) {}
 
   async write(statement: string) {
-    if (!this.stream || this.bytes + statement.length > this.maxBytes) {
+    return this.writeGroup([statement]);
+  }
+
+  /** Write statements that must land in the same file (a row and its appends). */
+  async writeGroup(statements: string[]) {
+    const size = statements.reduce((n, s) => n + Buffer.byteLength(s), 0);
+    if (!this.stream || (this.bytes > 0 && this.bytes + size > this.maxBytes)) {
       await this.rotate();
     }
     const stream = this.stream as WriteStream;
-    this.bytes += statement.length;
-    if (!stream.write(statement)) {
-      await new Promise<void>(resolve => stream.once('drain', () => resolve()));
+    this.bytes += size;
+    for (const statement of statements) {
+      if (!stream.write(statement)) {
+        await new Promise<void>(resolve => stream.once('drain', () => resolve()));
+      }
     }
   }
 
@@ -289,12 +399,15 @@ async function exportTable(
   let batch: string[] = [];
   let batchBytes = 0;
   let exported = 0;
+  let wide = 0;
 
+  const headerBytes = Buffer.byteLength(header);
+  batchBytes = headerBytes;
   const flush = async () => {
     if (!batch.length) return;
     await writer.write(`${header}${batch.join(',\n')};\n`);
     batch = [];
-    batchBytes = 0;
+    batchBytes = headerBytes;
   };
 
   await client.query('BEGIN');
@@ -310,15 +423,21 @@ async function exportTable(
     if (!rows.length) break;
 
     for (const row of rows as unknown[][]) {
-      const tuple = `(${row.map((v, i) => toSqliteLiteral(v, columns[i].type)).join(', ')})`;
-      if (
-        batch.length >= opts.rowsPerStatement ||
-        batchBytes + tuple.length > MAX_STATEMENT_BYTES
-      ) {
+      const result = rowStatements(table, columns, row, header);
+      if ('statements' in result) {
+        await flush();
+        await writer.writeGroup(result.statements);
+        wide++;
+        exported++;
+        continue;
+      }
+      const { tuple } = result;
+      const tupleBytes = Buffer.byteLength(tuple);
+      if (batch.length >= opts.rowsPerStatement || batchBytes + tupleBytes > MAX_STATEMENT_BYTES) {
         await flush();
       }
       batch.push(tuple);
-      batchBytes += tuple.length + 2;
+      batchBytes += tupleBytes + 2;
       exported++;
     }
 
@@ -330,7 +449,9 @@ async function exportTable(
   await client.query('COMMIT');
   await writer.close();
   process.stdout.write(
-    `${process.stdout.isTTY ? '\r' : ''}  ${table.name}: ${exported}/${total} rows -> ${writer.files.length} file(s)\n`,
+    `${process.stdout.isTTY ? '\r' : ''}  ${table.name}: ${exported}/${total} rows -> ${writer.files.length} file(s)${
+      wide ? ` (${wide} wide row(s) written in slices)` : ''
+    }\n`,
   );
 
   return { rows: exported, files: writer.files };

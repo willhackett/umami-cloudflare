@@ -59,8 +59,14 @@ Notes:
 - Upgrade the source to the umami version this checkout is based on first
   (`prisma migrate deploy` upstream), so that columns line up. Columns missing in the
   source get D1 defaults; the export tells you which.
+- Pass the source as `SOURCE_DATABASE_URL=... pnpm cf:migrate:export` rather than
+  `--source` if you do not want pnpm to echo the connection string.
 - Statements are `INSERT OR REPLACE`, so re-running the import (or resuming with
-  `--from <file>`) is safe. Existing rows with the same ids, including the seeded
+  `--from <file>`) is safe.
+- Values too big for one D1 statement (100 KB; session replay chunks commonly are)
+  are written as an INSERT with the first slice followed by `UPDATE ... || slice`
+  appends (`unhex(hex(col) || ...)` for blobs), always in the same file, so a
+  resume never half-applies a row. Existing rows with the same ids, including the seeded
   `admin` user, are overwritten by the source's rows.
 - D1 databases are limited to 10 GB. The export prints the source size and warns above
   that; use `--exclude session_replay,heatmap_event` or `--tables ...` to leave out
