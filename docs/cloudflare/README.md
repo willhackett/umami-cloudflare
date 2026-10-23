@@ -36,7 +36,7 @@ pnpm cf:deploy
 `pnpm cf:deploy` runs the full pipeline: generate the SQLite Prisma schema and client,
 build the tracker/recorder scripts, build the Next.js app with OpenNext, apply D1
 migrations remotely and deploy the Worker. The first login is `admin` / `umami`
-(umami seeds it on first start).
+(seeded by the initial D1 migration); change the password straight away.
 
 Optional:
 

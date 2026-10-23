@@ -16,7 +16,7 @@ src/lib/cloudflare/
   sql/translate.ts       # Postgres -> SQLite SQL translation (the heart of the port)
   sql/timezone.ts        # Intl-based offset tables for `at time zone`
   sql/translate.test.ts
-  stubs/*.ts             # empty @clickhouse/client, kafkajs, maxmind, redis, @prisma/adapter-pg
+  stubs/*.ts             # @clickhouse/client, kafkajs, maxmind, redis, @prisma/adapter-pg, is-localhost-ip
 src/cloudflare/worker.ts # Worker entry: wraps OpenNext handler, injects geo headers
 scripts/cloudflare/      # schema derivation, D1 migration diff, upstream sync
 prisma/schema.sqlite.prisma   # GENERATED from prisma/schema.prisma (pnpm cf:schema)
@@ -107,7 +107,8 @@ its no-cache code paths, as it does without `REDIS_URL`.
 
 Upstream imports these modules unconditionally but only instantiates them when their
 env vars are set. The bundler aliases the packages to tiny stubs so the Node-only drivers
-never reach the Worker bundle.
+never reach the Worker bundle. `is-localhost-ip` is also stubbed: it probes addresses by
+binding a UDP socket, which never completes in workerd and would hang `/api/send`.
 
 ### Next.js on Workers
 

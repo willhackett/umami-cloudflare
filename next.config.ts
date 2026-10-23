@@ -215,6 +215,7 @@ const cloudflareAliases = {
   maxmind: './src/lib/cloudflare/stubs/maxmind.ts',
   redis: './src/lib/cloudflare/stubs/redis.ts',
   '@prisma/adapter-pg': './src/lib/cloudflare/stubs/adapter-pg.ts',
+  'is-localhost-ip': './src/lib/cloudflare/stubs/is-localhost-ip.ts',
 };
 
 /** @type {import('next').NextConfig} */
@@ -238,10 +239,7 @@ export default withNextIntl({
     'isbot',
     'bcryptjs',
     'otplib',
-    'uuid',
     'ipaddr.js',
-    'is-localhost-ip',
-    'maxmind',
     'jszip',
     'papaparse',
   ],

@@ -611,3 +611,5 @@ CREATE UNIQUE INDEX "two_factor_otp_used_user_id_otp_key" ON "two_factor_otp_use
 -- CreateIndex
 CREATE UNIQUE INDEX "two_factor_rate_limit_user_id_key" ON "two_factor_rate_limit"("user_id");
 
+-- Default admin user (admin / umami), same as upstream's 01_init migration.
+INSERT OR IGNORE INTO "user" ("user_id", "username", "role", "password") VALUES ('41e2b680-648e-4b09-bcd7-3e2b10c06264', 'admin', 'admin', '$2b$10$BUli0c.muyCW1ErNJc3jL.vFRFtFJWrT8/GcR4A.sUdCznaXiqFXa');
