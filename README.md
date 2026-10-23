@@ -1,3 +1,7 @@
+> **umami-cloudflare** — this fork runs umami entirely on Cloudflare (Workers + D1 + KV).
+> See [docs/cloudflare/README.md](docs/cloudflare/README.md) to deploy and
+> [docs/cloudflare/CONVERSION.md](docs/cloudflare/CONVERSION.md) for how the port works and how upstream is merged.
+
 <p align="center">
   <img src="https://content.umami.is/website/images/umami-logo.png" alt="Umami Logo" width="100">
 </p>
