@@ -485,11 +485,14 @@ function passAggregates(sql: string, jsonColumns: string[]): string {
     (_, p, expr) => percentileSQL(p, expr.trim()),
   );
 
-  // mode() has no SQLite equivalent; umami only uses it for page/viewport sizes
-  // within a visit, where the values are effectively constant. max() is a safe stand-in.
+  // mode() within group (order by x): SQLite evaluates an aggregate inside a
+  // correlated scalar subquery in the enclosing group, so the most frequent value
+  // can be picked from json_group_array(x). Ties resolve to the smallest value,
+  // matching Postgres' "first in sort order" behaviour. NULLs are ignored.
   out = out.replace(
-    /mode\s*\(\s*\)\s*within\s+group\s*\(\s*order\s+by\s+([^()]+?)\s*\)/gi,
-    'max($1)',
+    /mode\s*\(\s*\)\s*within\s+group\s*\(\s*order\s+by\s+([^()]+?)(?:\s+(?:asc|desc))?\s*\)/gi,
+    (_, expr) =>
+      `(select value from json_each(json_group_array(${expr})) where value is not null group by value order by count(*) desc, value limit 1)`,
   );
 
   out = out.replace(/\bbool_or\s*\(/gi, 'max(');
@@ -818,25 +821,48 @@ function passCast(sql: string): string {
   });
 }
 
-function passOperators(sql: string, listParams: Set<string>, regexParams: Set<string>): string {
+function passOperators(
+  sql: string,
+  data: Record<string, unknown>,
+  listParams: Set<string>,
+  regexParams: Map<string, string[]>,
+): string {
   let out = sql;
 
   out = out.replace(/\bnot\s+ilike\b/gi, 'not like').replace(/\bilike\b/gi, 'like');
 
+  // `= ANY({{p}})` / `!= ALL({{p}})`: the array is bound as one JSON parameter and
+  // expanded with json_each(), so long lists never hit D1's 100-parameter limit.
   out = out.replace(/=\s*any\s*\(\s*(\{\{\s*(\w+)[^}]*\}\})\s*\)/gi, (_, ph, name) => {
     listParams.add(name);
-    return `in ${ph}`;
+    return `in (select value from json_each(${ph}))`;
   });
 
   out = out.replace(/!=\s*all\s*\(\s*(\{\{\s*(\w+)[^}]*\}\})\s*\)/gi, (_, ph, name) => {
     listParams.add(name);
-    return `not in ${ph}`;
+    return `not in (select value from json_each(${ph}))`;
   });
 
-  out = out.replace(/(!?)~\*\s*(\{\{\s*(\w+)[^}]*\}\})/g, (_, not, ph, name) => {
-    regexParams.add(name);
-    return `${not ? 'not like' : 'like'} ${ph}`;
-  });
+  // `col ~* {{p}}` / `col !~* {{p}}`: compile the regex into GLOB patterns
+  // (one per alternation branch) applied to lower(col).
+  const regexRe = /(!?)~\*\s*\{\{\s*(\w+)[^}]*\}\}/g;
+  let m: RegExpExecArray | null = regexRe.exec(out);
+  while (m) {
+    const [whole, not, name] = m;
+    const value = data[name];
+    if (typeof value !== 'string') {
+      throw new SqliteTranslateError(`Regex filter ${name} must be a string`);
+    }
+    const start = operandStart(out, m.index);
+    const column = out.slice(start, m.index).trim();
+    const patterns = regexToGlob(value);
+    regexParams.set(name, patterns);
+    const clauses = patterns.map((_, i) => `lower(${column}) glob {{${name}::glob${i}}}`);
+    const replacement = `${not ? 'not ' : ''}(${clauses.join(' or ')})`;
+    out = out.slice(0, start) + replacement + out.slice(m.index + whole.length);
+    regexRe.lastIndex = start + replacement.length;
+    m = regexRe.exec(out);
+  }
 
   out = rewriteCalls(out, 'left', (_args, parts) => `substr(${parts[0]}, 1, ${parts[1]})`);
   out = out.replace(/(?<![\w.])position\s*\(/gi, 'instr(');
@@ -853,55 +879,246 @@ function passOperators(sql: string, listParams: Set<string>, regexParams: Set<st
 // Parameters
 // ---------------------------------------------------------------------------
 
-/** Convert a simple regular expression into a LIKE pattern, or throw. */
-export function regexToLike(pattern: string): string {
-  let p = pattern;
-  let anchoredStart = false;
-  let anchoredEnd = false;
+/** Hard cap on the number of GLOB patterns one regex may expand to. */
+const MAX_GLOB_PATTERNS = 64;
+/** Upper bound used when expanding unbounded repetition (`+`, `*`, `{n,}`). */
+const MAX_REPEAT = 12;
 
-  if (p.startsWith('^')) {
-    anchoredStart = true;
-    p = p.slice(1);
-  }
-  if (p.endsWith('$') && !p.endsWith('\\$')) {
-    anchoredEnd = true;
-    p = p.slice(0, -1);
-  }
+const ANCHOR_START = '\u0001';
+const ANCHOR_END = '\u0002';
 
-  let like = '';
-  for (let i = 0; i < p.length; i++) {
-    const ch = p[i];
-    if (ch === '\\') {
-      const next = p[i + 1];
-      if (next === undefined) throw new SqliteTranslateError('Unsupported regex');
-      if (/[.*+?^$()[\]{}|\\/]/.test(next)) {
-        like += next;
-        i++;
-        continue;
-      }
-      throw new SqliteTranslateError('Regex filters with escape sequences are not supported on D1');
+/**
+ * Compile a regular expression (as used by umami's "matches regex" filters, Postgres
+ * `~*` semantics) into one or more lower-cased SQLite GLOB patterns.
+ *
+ * Supported: `^`/`$` anchors, `.`, escaped literals, `\d \w \s` (and negations),
+ * character classes `[...]`, groups `(...)`/`(?:...)`, alternation `a|b`, and the
+ * quantifiers `* + ? {n} {n,m} {n,}`. Alternation and quantifiers are expanded into
+ * separate patterns (repetition is bounded at MAX_REPEAT), which is exact up to that
+ * bound. Anything else throws a SqliteTranslateError.
+ */
+export function regexToGlob(pattern: string): string[] {
+  const alternatives = new RegexGlobCompiler(pattern).compile();
+
+  return alternatives.map(alt => {
+    let glob = alt;
+    let anchoredStart = false;
+    let anchoredEnd = false;
+    if (glob.startsWith(ANCHOR_START)) {
+      anchoredStart = true;
+      glob = glob.slice(1);
     }
-    if (ch === '.' && p[i + 1] === '*') {
-      like += '%';
-      i++;
-      continue;
+    if (glob.endsWith(ANCHOR_END)) {
+      anchoredEnd = true;
+      glob = glob.slice(0, -1);
+    }
+    if (glob.includes(ANCHOR_START) || glob.includes(ANCHOR_END)) {
+      throw new SqliteTranslateError('Regex anchors are only supported at the start and end');
+    }
+    const prefix = anchoredStart || glob.startsWith('*') ? '' : '*';
+    const suffix = anchoredEnd || glob.endsWith('*') ? '' : '*';
+    return `${prefix}${glob}${suffix}`.toLowerCase();
+  });
+}
+
+class RegexGlobCompiler {
+  private pos = 0;
+
+  constructor(private readonly src: string) {}
+
+  compile(): string[] {
+    const result = this.parseAlternation();
+    if (this.pos < this.src.length) {
+      throw new SqliteTranslateError(`Unexpected "${this.src[this.pos]}" in regex`);
+    }
+    return result;
+  }
+
+  private parseAlternation(): string[] {
+    let branches = this.parseSequence();
+    while (this.src[this.pos] === '|') {
+      this.pos++;
+      branches = branches.concat(this.parseSequence());
+      this.checkSize(branches.length);
+    }
+    return branches;
+  }
+
+  private parseSequence(): string[] {
+    let acc: string[] = [''];
+    while (this.pos < this.src.length && this.src[this.pos] !== '|' && this.src[this.pos] !== ')') {
+      const atom = this.parseAtom();
+      const expanded = this.applyQuantifier(atom);
+      const next: string[] = [];
+      for (const a of acc) for (const b of expanded) next.push(a + b);
+      this.checkSize(next.length);
+      acc = next;
+    }
+    return acc;
+  }
+
+  /** Returns the alternatives for one atom (a group may have several). */
+  private parseAtom(): string[] {
+    const ch = this.src[this.pos];
+
+    if (ch === '^') {
+      this.pos++;
+      return [ANCHOR_START];
+    }
+    if (ch === '$') {
+      this.pos++;
+      return [ANCHOR_END];
+    }
+    if (ch === '(') {
+      this.pos++;
+      if (this.src.startsWith('?:', this.pos)) this.pos += 2;
+      else if (this.src[this.pos] === '?') {
+        throw new SqliteTranslateError('Lookaround and named groups are not supported');
+      }
+      const inner = this.parseAlternation();
+      if (this.src[this.pos] !== ')') throw new SqliteTranslateError('Unbalanced ( in regex');
+      this.pos++;
+      return inner;
+    }
+    if (ch === '[') {
+      return [this.parseClass()];
+    }
+    if (ch === '\\') {
+      this.pos++;
+      const next = this.src[this.pos++];
+      if (next === undefined) throw new SqliteTranslateError('Trailing backslash in regex');
+      return [this.escapeToGlob(next)];
     }
     if (ch === '.') {
-      like += '_';
-      continue;
+      this.pos++;
+      // `.*` and `.+` map directly onto GLOB wildcards
+      if (this.src[this.pos] === '*') {
+        this.pos++;
+        return ['*'];
+      }
+      if (this.src[this.pos] === '+') {
+        this.pos++;
+        return ['?*'];
+      }
+      return ['?'];
     }
-    if (/[*+?()[\]{}|^$]/.test(ch)) {
-      throw new SqliteTranslateError(
-        'Regex filters are not supported on Cloudflare D1; use "contains" instead',
-      );
+    if (ch === '*' || ch === '+' || ch === '?' || ch === '{') {
+      throw new SqliteTranslateError(`Nothing to repeat before "${ch}" in regex`);
     }
-    like += ch;
+    this.pos++;
+    return [globLiteral(ch)];
   }
 
-  const prefix = anchoredStart || like.startsWith('%') ? '' : '%';
-  const suffix = anchoredEnd || like.endsWith('%') ? '' : '%';
+  private parseClass(): string {
+    // assumes src[pos] === '['
+    this.pos++;
+    let out = '[';
+    if (this.src[this.pos] === '^') {
+      out += '^';
+      this.pos++;
+    }
+    let first = true;
+    while (this.pos < this.src.length && (first || this.src[this.pos] !== ']')) {
+      const ch = this.src[this.pos++];
+      first = false;
+      if (ch === '\\') {
+        const next = this.src[this.pos++];
+        if (next === undefined) throw new SqliteTranslateError('Trailing backslash in regex');
+        out += CLASS_ESCAPES[next] ?? (next === ']' ? ']' : next);
+        continue;
+      }
+      out += ch;
+    }
+    if (this.src[this.pos] !== ']') throw new SqliteTranslateError('Unbalanced [ in regex');
+    this.pos++;
+    return `${out}]`;
+  }
 
-  return `${prefix}${like}${suffix}`;
+  private escapeToGlob(ch: string): string {
+    const cls = CLASS_ESCAPES[ch];
+    if (cls) return ch === ch.toUpperCase() && /[DWS]/.test(ch) ? `[^${cls}]` : `[${cls}]`;
+    if (ch === 'n') return '\n';
+    if (ch === 't') return '\t';
+    if (ch === 'r') return '\r';
+    if (/[a-z0-9]/i.test(ch)) throw new SqliteTranslateError(`Unsupported escape \\${ch} in regex`);
+    return globLiteral(ch);
+  }
+
+  private applyQuantifier(atom: string[]): string[] {
+    const ch = this.src[this.pos];
+    let min: number;
+    let max: number;
+
+    if (ch === '*') {
+      min = 0;
+      max = MAX_REPEAT;
+      this.pos++;
+    } else if (ch === '+') {
+      min = 1;
+      max = MAX_REPEAT;
+      this.pos++;
+    } else if (ch === '?') {
+      min = 0;
+      max = 1;
+      this.pos++;
+    } else if (ch === '{') {
+      const m = /^\{(\d+)(?:(,)(\d*))?\}/.exec(this.src.slice(this.pos));
+      if (!m) throw new SqliteTranslateError('Unsupported {} quantifier in regex');
+      min = Number(m[1]);
+      max = m[2] ? (m[3] ? Number(m[3]) : min + MAX_REPEAT - 1) : min;
+      if (max < min) throw new SqliteTranslateError('Invalid {} quantifier in regex');
+      this.pos += m[0].length;
+    } else {
+      return atom;
+    }
+
+    if (this.src[this.pos] === '?') this.pos++; // lazy modifier: irrelevant for matching
+
+    if (atom.some(a => a.includes(ANCHOR_START) || a.includes(ANCHOR_END))) {
+      throw new SqliteTranslateError('Cannot repeat an anchor in regex');
+    }
+
+    // A wildcard atom repeated is still a wildcard.
+    if (atom.length === 1 && atom[0] === '?' && max >= MAX_REPEAT) {
+      return [min === 0 ? '*' : `${'?'.repeat(min)}*`];
+    }
+
+    const out = new Set<string>();
+    for (let n = min; n <= max; n++) {
+      let reps: string[] = [''];
+      for (let i = 0; i < n; i++) {
+        const next: string[] = [];
+        for (const r of reps) for (const a of atom) next.push(r + a);
+        reps = next;
+        this.checkSize(reps.length);
+      }
+      for (const r of reps) out.add(r);
+      this.checkSize(out.size);
+    }
+    return [...out];
+  }
+
+  private checkSize(n: number) {
+    if (n > MAX_GLOB_PATTERNS) {
+      throw new SqliteTranslateError(
+        'Regex filter is too complex for Cloudflare D1; simplify the pattern or use "contains"',
+      );
+    }
+  }
+}
+
+const CLASS_ESCAPES: Record<string, string> = {
+  d: '0-9',
+  D: '0-9',
+  w: 'a-zA-Z0-9_',
+  W: 'a-zA-Z0-9_',
+  s: ' \t\n\r',
+  S: ' \t\n\r',
+};
+
+/** Escape a literal character for use in a GLOB pattern. */
+function globLiteral(ch: string): string {
+  return ch === '*' || ch === '?' || ch === '[' ? `[${ch}]` : ch;
 }
 
 export function toSqliteValue(value: unknown, type?: string): unknown {
@@ -922,22 +1139,25 @@ function passParams(
   sql: string,
   data: Record<string, unknown>,
   listParams: Set<string>,
-  regexParams: Set<string>,
+  regexParams: Map<string, string[]>,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
 
   const out = sql.replace(/\{\{\s*(\w+)(?:::(\w+))?\s*\}\}/g, (_, name, type) => {
     const value = data[name];
 
-    if (listParams.has(name) || Array.isArray(value)) {
-      const values = Array.isArray(value) ? value : [value];
-      if (values.length === 0) return '(null)';
-      for (const v of values) params.push(toSqliteValue(v, type));
-      return `(${values.map(() => '?').join(', ')})`;
+    const globMatch = /^glob(\d+)$/.exec(type ?? '');
+    if (globMatch) {
+      const patterns = regexParams.get(name);
+      if (!patterns) throw new SqliteTranslateError(`Unknown regex parameter ${name}`);
+      params.push(patterns[Number(globMatch[1])]);
+      return '?';
     }
 
-    if (regexParams.has(name) && typeof value === 'string') {
-      params.push(regexToLike(value));
+    if (listParams.has(name) || Array.isArray(value)) {
+      // bound as a JSON array; the SQL side reads it through json_each()
+      const values = Array.isArray(value) ? value : [value];
+      params.push(JSON.stringify(values.map(v => toSqliteValue(v, type))));
       return '?';
     }
 
@@ -955,7 +1175,7 @@ function passParams(
 export function translateQuery(sql: string, data: Record<string, unknown> = {}): TranslatedQuery {
   const jsonColumns: string[] = [];
   const listParams = new Set<string>();
-  const regexParams = new Set<string>();
+  const regexParams = new Map<string, string[]>();
 
   let out = sql;
   out = passJsonArray(out);
@@ -972,7 +1192,7 @@ export function translateQuery(sql: string, data: Record<string, unknown> = {}):
   out = passColonCasts(out);
   out = passDateDiff(out);
   out = passCast(out);
-  out = passOperators(out, listParams, regexParams);
+  out = passOperators(out, data, listParams, regexParams);
 
   const { sql: finalSql, params } = passParams(out, data, listParams, regexParams);
 

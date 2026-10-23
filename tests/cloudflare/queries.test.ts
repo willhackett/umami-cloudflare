@@ -199,6 +199,28 @@ async function seed() {
       scrollPct: 60,
       createdAt: new Date('2024-03-05T10:00:10Z'),
     },
+    // scroll events: page width 1440 twice and 1280 once, so mode() must pick 1440
+    ...[
+      [1440, 30],
+      [1440, 60],
+      [1280, 90],
+    ].map(([pageW, scrollPct], i) => ({
+      websiteId: WEBSITE_ID,
+      sessionId: SESSION_A,
+      visitId: VISIT_A,
+      urlPath: '/',
+      eventType: 2,
+      x: 0,
+      y: 0,
+      pageX: 0,
+      pageY: 0,
+      pageW,
+      viewportW: 1440,
+      viewportH: 900,
+      pageH: 3000,
+      scrollPct,
+      createdAt: new Date(`2024-03-05T10:00:${20 + i}Z`),
+    })),
   ]);
 
   await sql.saveRecording({
@@ -250,6 +272,30 @@ describe('stats', () => {
       filters({ browser: 'chrome', excludeBounce: true }),
     );
     expect(Number(stats.pageviews)).toBe(3);
+  });
+
+  test('getWebsiteStats with regex, not-regex and list filters', async () => {
+    const blog: any = await sql.getWebsiteStats(WEBSITE_ID, filters({ path: 're.^/BLOG/.*' }));
+    expect(Number(blog.pageviews)).toBe(1);
+
+    const notBlog: any = await sql.getWebsiteStats(WEBSITE_ID, filters({ path: 'nre.^/blog' }));
+    expect(Number(notBlog.pageviews)).toBe(4);
+
+    const alternation: any = await sql.getWebsiteStats(
+      WEBSITE_ID,
+      filters({ path: 're.^/(pricing|signup)$' }),
+    );
+    expect(Number(alternation.pageviews)).toBe(2);
+
+    const list: any = await sql.getWebsiteStats(WEBSITE_ID, filters({ path: 'eq./,/pricing' }));
+    expect(Number(list.pageviews)).toBe(3);
+
+    const longList = Array.from({ length: 300 }, (_, i) => `/nope-${i}`).concat('/signup');
+    const many: any = await sql.getWebsiteStats(
+      WEBSITE_ID,
+      filters({ path: `eq.${longList.join(',')}` }),
+    );
+    expect(Number(many.pageviews)).toBe(1);
   });
 
   test('getPageviewStats buckets in UTC and in a timezone', async () => {
@@ -478,8 +524,25 @@ describe('reports', () => {
     await expect(
       sql.getHeatmap(WEBSITE_ID, { ...filters(), urlPath: '/', mode: 'click' }),
     ).resolves.toBeDefined();
+    const scroll: any = await sql.getHeatmap(WEBSITE_ID, {
+      ...filters(),
+      urlPath: '/',
+      mode: 'scroll',
+    });
+    expect(scroll.scroll).toBeDefined();
+    expect(scroll.scroll).toMatchObject({
+      pageW: 1440,
+      pageH: 3000,
+      viewportW: 1440,
+      viewportH: 900,
+      totalSessions: 1,
+    });
+    expect(scroll.scroll.buckets).toEqual([
+      { depth: 90, sessions: 1, pageW: 1440, pageH: 3000, viewportW: 1440, viewportH: 900 },
+    ]);
+
     await expect(
-      sql.getHeatmap(WEBSITE_ID, { ...filters(), urlPath: '/', mode: 'scroll' }),
+      sql.getHeatmap(WEBSITE_ID, { ...filters(), urlPath: '/', mode: 'click', path: 're.^/$' }),
     ).resolves.toBeDefined();
   });
 });

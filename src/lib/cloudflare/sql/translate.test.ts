@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { getLocalTimeSQL, getOffsetSeconds, getZoneInfo, toCanonicalTimestamp } from './timezone';
-import { mapToCharFormat, regexToLike, SqliteTranslateError, translateQuery } from './translate';
+import { mapToCharFormat, regexToGlob, SqliteTranslateError, translateQuery } from './translate';
 
 describe('translateQuery', () => {
   test('binds {{params}} positionally and converts dates', () => {
@@ -23,31 +23,50 @@ describe('translateQuery', () => {
     ]);
   });
 
-  test('expands array params for = ANY / != ALL', () => {
+  test('binds array params as JSON for = ANY / != ALL', () => {
     const { sql, params } = translateQuery(
       'where session.browser = ANY({{browser}}) and session.os != ALL({{os}})',
       { browser: ['chrome', 'firefox'], os: ['ios'] },
     );
 
-    expect(sql).toBe('where session.browser in (?, ?) and session.os not in (?)');
-    expect(params).toEqual(['chrome', 'firefox', 'ios']);
+    expect(sql).toBe(
+      'where session.browser in (select value from json_each(?)) and session.os not in (select value from json_each(?))',
+    );
+    expect(params).toEqual(['["chrome","firefox"]', '["ios"]']);
   });
 
-  test('ilike -> like, regex -> like', () => {
+  test('long arrays stay within one bound parameter', () => {
+    const ids = Array.from({ length: 500 }, (_, i) => `id${i}`);
+    const { params } = translateQuery('where id = ANY({{ids::uuid}})', { ids });
+
+    expect(params).toHaveLength(1);
+    expect(JSON.parse(params[0] as string)).toHaveLength(500);
+  });
+
+  test('ilike -> like, regex -> glob', () => {
     const { sql, params } = translateQuery(
-      'where a ilike {{s}} and b not ilike {{s}} and c ~* {{r}} and d !~* {{r}}',
+      'where a ilike {{s}} and b not ilike {{s}} and website_event.url_path ~* {{r}} and d !~* {{r}}',
       {
         s: '%x%',
         r: '^/blog/.*',
       },
     );
 
-    expect(sql).toBe('where a like ? and b not like ? and c like ? and d not like ?');
-    expect(params).toEqual(['%x%', '%x%', '/blog/%', '/blog/%']);
+    expect(sql).toBe(
+      'where a like ? and b not like ? and (lower(website_event.url_path) glob ?) and not (lower(d) glob ?)',
+    );
+    expect(params).toEqual(['%x%', '%x%', '/blog/*', '/blog/*']);
   });
 
-  test('rejects regexes that cannot be expressed as LIKE', () => {
-    expect(() => translateQuery('where c ~* {{r}}', { r: '^/(a|b)$' })).toThrow(
+  test('regex alternation expands to several glob clauses', () => {
+    const { sql, params } = translateQuery('where c ~* {{r}}', { r: '^/(a|b)$' });
+
+    expect(sql).toBe('where (lower(c) glob ? or lower(c) glob ?)');
+    expect(params).toEqual(['/a', '/b']);
+  });
+
+  test('rejects regexes that cannot be expressed as GLOB', () => {
+    expect(() => translateQuery('where c ~* {{r}}', { r: '^/(?=a)' })).toThrow(
       SqliteTranslateError,
     );
   });
@@ -153,10 +172,12 @@ describe('translateQuery', () => {
     expect(sql).toMatch(/ as p75 from t$/);
   });
 
-  test('mode() within group -> max()', () => {
+  test('mode() within group -> most frequent value via json_each', () => {
     const { sql } = translateQuery(`(mode() within group (order by h.page_w))::int as page_w`);
 
-    expect(sql).toBe('cast((max(h.page_w)) as integer) as page_w');
+    expect(sql).toBe(
+      'cast(((select value from json_each(json_group_array(h.page_w)) where value is not null group by value order by count(*) desc, value limit 1)) as integer) as page_w',
+    );
   });
 
   test('regexp_replace of www prefix', () => {
@@ -207,9 +228,14 @@ describe('translateQuery', () => {
   });
 
   test('throws when more than 100 parameters would be bound', () => {
-    const ids = Array.from({ length: 101 }, (_, i) => `id${i}`);
+    const data: Record<string, string> = {};
+    const clauses: string[] = [];
+    for (let i = 0; i < 101; i++) {
+      data[`p${i}`] = `v${i}`;
+      clauses.push(`x = {{p${i}}}`);
+    }
 
-    expect(() => translateQuery('where id = ANY({{ids}})', { ids })).toThrow(/at most 100/);
+    expect(() => translateQuery(`where ${clauses.join(' or ')}`, data)).toThrow(/at most 100/);
   });
 });
 
@@ -219,13 +245,35 @@ describe('helpers', () => {
     expect(mapToCharFormat(`'YYYY-01-01"T"HH24:00:00"Z"'`)).toBe('%Y-01-01T%H:00:00Z');
   });
 
-  test('regexToLike', () => {
-    expect(regexToLike('foo')).toBe('%foo%');
-    expect(regexToLike('^foo$')).toBe('foo');
-    expect(regexToLike('a.c')).toBe('%a_c%');
-    expect(regexToLike('^/docs/.*')).toBe('/docs/%');
-    expect(regexToLike('a\\.b')).toBe('%a.b%');
-    expect(() => regexToLike('a+b')).toThrow(SqliteTranslateError);
+  test('regexToGlob', () => {
+    expect(regexToGlob('foo')).toEqual(['*foo*']);
+    expect(regexToGlob('^Foo$')).toEqual(['foo']);
+    expect(regexToGlob('a.c')).toEqual(['*a?c*']);
+    expect(regexToGlob('^/docs/.*')).toEqual(['/docs/*']);
+    expect(regexToGlob('^/docs/.+$')).toEqual(['/docs/?*']);
+    expect(regexToGlob('a\\.b')).toEqual(['*a.b*']);
+    expect(regexToGlob('\\.pdf$')).toEqual(['*.pdf']);
+    expect(regexToGlob('^/(a|b)/c')).toEqual(['/a/c*', '/b/c*']);
+    expect(regexToGlob('^/x|^/y$')).toEqual(['/x*', '/y']);
+    expect(regexToGlob('colou?r')).toEqual(['*color*', '*colour*']);
+    expect(regexToGlob('^/post/\\d{1,3}$')).toEqual([
+      '/post/[0-9]',
+      '/post/[0-9][0-9]',
+      '/post/[0-9][0-9][0-9]',
+    ]);
+    expect(regexToGlob('^/post/\\d+$')).toHaveLength(12);
+    expect(regexToGlob('^[A-Z][a-z]+$')[0]).toBe('[a-z][a-z]');
+    expect(regexToGlob('a*b')).toContain('*b*');
+    expect(regexToGlob('a*b')).toContain('*ab*');
+    expect(regexToGlob('[^/]+')).toContain('*[^/]*');
+    expect(regexToGlob('q=\\*')).toEqual(['*q=[*]*']);
+    expect(regexToGlob('^/[?]x')).toEqual(['/[?]x*']);
+    expect(regexToGlob('\\s+')).toHaveLength(12);
+    expect(() => regexToGlob('a(?=b)')).toThrow(SqliteTranslateError);
+    expect(() => regexToGlob('(a|b|c|d){4}')).toThrow(/too complex/);
+    expect(() => regexToGlob('a^b')).toThrow(SqliteTranslateError);
+    expect(() => regexToGlob('(ab')).toThrow(SqliteTranslateError);
+    expect(() => regexToGlob('+a')).toThrow(SqliteTranslateError);
   });
 
   test('timezone offsets', () => {
