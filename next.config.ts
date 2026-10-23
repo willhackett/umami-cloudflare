@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { initOpenNextCloudflareForDev } from '@opennextjs/cloudflare';
 import createNextIntlPlugin from 'next-intl/plugin';
 import pkg from './package.json' with { type: 'json' };
 import { getContentSecurityPolicy } from './src/lib/csp';
@@ -205,9 +206,23 @@ if (isProd && cloudMode) {
   });
 }
 
+// umami-cloudflare: swap Node-only infrastructure drivers for Cloudflare equivalents.
+// Upstream source is untouched; the bundler resolves these specifiers to our modules.
+const cloudflareAliases = {
+  '@/lib/redis': './src/lib/cloudflare/redis.ts',
+  '@clickhouse/client': './src/lib/cloudflare/stubs/clickhouse-client.ts',
+  kafkajs: './src/lib/cloudflare/stubs/kafkajs.ts',
+  maxmind: './src/lib/cloudflare/stubs/maxmind.ts',
+  redis: './src/lib/cloudflare/stubs/redis.ts',
+  '@prisma/adapter-pg': './src/lib/cloudflare/stubs/adapter-pg.ts',
+};
+
 /** @type {import('next').NextConfig} */
 export default withNextIntl({
   reactStrictMode: false,
+  turbopack: {
+    resolveAlias: cloudflareAliases,
+  },
   devIndicators: {
     position: 'bottom-right',
   },
@@ -259,3 +274,6 @@ export default withNextIntl({
     return [...redirects];
   },
 });
+
+// umami-cloudflare: expose Cloudflare bindings (D1, KV) to `next dev`.
+initOpenNextCloudflareForDev();

@@ -2,6 +2,8 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { readReplicas } from '@prisma/extension-read-replicas';
 import debug from 'debug';
 import { PrismaClient } from '@/generated/prisma/client';
+import { createLazyD1Client, runD1RawQuery } from '@/lib/cloudflare/d1';
+import { isD1 } from '@/lib/db';
 import { DATA_TYPE, DEFAULT_PAGE_SIZE, FILTER_COLUMNS, OPERATORS, SESSION_COLUMNS } from './constants';
 import { filtersObjectToArray } from './params';
 import type { Operator, PropertyFilter, QueryFilters, QueryOptions } from './types';
@@ -721,6 +723,11 @@ async function executeRawQuery(
     log('PARAMETERS:\n', data);
     log('NAME:\n', name);
   }
+  // umami-cloudflare: route raw SQL through the Postgres -> SQLite translator.
+  if (isD1()) {
+    return runD1RawQuery(sql, data, name);
+  }
+
   const params = [];
   const schema = getSchema();
 
@@ -863,6 +870,12 @@ function getClient() {
 
   if (!url) {
     throw new Error('DATABASE_URL is not set.');
+  }
+
+  // umami-cloudflare: lazy D1-backed client (bindings only exist inside a request).
+  if (isD1(url)) {
+    globalThis[PRISMA] ??= createLazyD1Client();
+    return globalThis[PRISMA];
   }
 
   const schema = getSchema();

@@ -3,6 +3,8 @@ export const POSTGRESQL = 'postgresql';
 export const CLICKHOUSE = 'clickhouse';
 export const KAFKA = 'kafka';
 export const KAFKA_PRODUCER = 'kafka-producer';
+// umami-cloudflare: Cloudflare D1 (SQLite). DATABASE_URL=d1://<binding>
+export const D1 = 'd1';
 
 // Fixes issue with converting bigint values
 (BigInt.prototype as unknown as { toJSON(): number }).toJSON = function () {
@@ -19,8 +21,12 @@ export function getDatabaseType(url = process.env.DATABASE_URL) {
   return type;
 }
 
+export function isD1(url = process.env.DATABASE_URL) {
+  return getDatabaseType(url) === D1;
+}
+
 export function isRelationalOnly() {
-  return !process.env.CLICKHOUSE_URL && getDatabaseType() === POSTGRESQL;
+  return !process.env.CLICKHOUSE_URL && [POSTGRESQL, D1].includes(getDatabaseType());
 }
 
 export async function runQuery(queries: any) {
@@ -34,7 +40,7 @@ export async function runQuery(queries: any) {
 
   const db = getDatabaseType();
 
-  if (db === POSTGRESQL) {
+  if (db === POSTGRESQL || db === D1) {
     return queries[PRISMA]();
   }
 }

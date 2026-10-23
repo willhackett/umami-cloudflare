@@ -22,6 +22,7 @@
     "incremental": false,
     "outDir": "./build",
     "paths": {
+      "@/lib/redis": ["./src/lib/cloudflare/redis"],
       "@/*": ["./src/*"]
     },
     "plugins": [
